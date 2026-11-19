@@ -2,18 +2,25 @@
 
 import json
 import os
+import shutil
+import socket
+import ssl
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
+import warnings
 import urllib.request
-from http.server import HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import waf  # noqa: E402
+import waf_report  # noqa: E402
 from demo_site import DemoHandler  # noqa: E402
 
 RULES_FILE = os.path.join(ROOT, "rules.json")
@@ -47,6 +54,23 @@ class TestNormalize(unittest.TestCase):
 
     def test_null_bytes(self):
         self.assertEqual(waf.normalize("ab%00c"), "abc")
+
+
+class TestIPSet(unittest.TestCase):
+    def test_single_ip_and_cidr(self):
+        nets = waf.IPSet(["1.2.3.4", "10.0.0.0/8", "2001:db8::/32"])
+        self.assertIn("1.2.3.4", nets)
+        self.assertIn("10.42.7.1", nets)
+        self.assertIn("2001:db8::1", nets)
+        self.assertNotIn("1.2.3.5", nets)
+        self.assertNotIn("11.0.0.1", nets)
+
+    def test_garbage_ip_is_not_in_set(self):
+        self.assertNotIn("pas-une-ip", waf.IPSet(["0.0.0.0/0"]))
+
+    def test_invalid_entry_fails_at_startup(self):
+        with self.assertRaises(ValueError):
+            waf.IPSet(["999.1.1.1"])
 
 
 class TestCards(unittest.TestCase):
@@ -110,6 +134,16 @@ class TestRules(unittest.TestCase):
                 self.assertIsNotNone(self.rules.scan_response(text))
         self.assertIsNone(self.rules.scan_response("<h1>Bienvenue sur la boutique</h1>"))
 
+    def test_exclusions(self):
+        payload = {"body": "SELECT name FROM information_schema.tables"}
+        score, _ = self.rules.scan(payload, "/search")
+        self.assertGreaterEqual(score, 5)                       # bloque ailleurs...
+        score, _ = self.rules.scan(payload, "/admin/sql-console")
+        self.assertEqual(score, 0)                              # ...autorise dans la console SQL
+        # Une exception ne desactive que les regles listees, pas tout le WAF
+        score, _ = self.rules.scan({"body": "<script>alert(1)</script>"}, "/admin/sql-console")
+        self.assertGreaterEqual(score, 5)
+
     def test_scanner_detection(self):
         self.assertEqual(self.rules.check_agent("sqlmap/1.7#stable"), "sqlmap")
         self.assertIsNone(self.rules.check_agent("Mozilla/5.0"))
@@ -154,6 +188,181 @@ class TestState(unittest.TestCase):
         metrics = self.state.metrics()
         self.assertIn('miniwaf_events_total{type="blocked"} 1', metrics)
         self.assertIn('miniwaf_attacks_total{category="XSS"} 1', metrics)
+
+
+class TestReport(unittest.TestCase):
+    def test_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "waf.log")
+            old = [{"action": "blocked", "ip": "6.6.6.6", "categories": ["XSS"], "path": "/s?q=x",
+                    "rules": ["2001 Balise script (url)"], "time": "2026-11-19 09:00:00"}]
+            new = [{"action": "blocked", "ip": "6.6.6.6", "categories": ["SQLi", "Scanner"],
+                    "path": "/login", "time": "2026-11-19 10:05:00",
+                    "rules": ["1001 UNION SELECT (url)", "9001 Outil detecte : sqlmap (header:User-Agent)"]},
+                   {"action": "trap", "ip": "7.7.7.7", "categories": ["Piege"], "path": "/.env",
+                    "time": "2026-11-19 10:06:00"},
+                   {"action": "banned", "ip": "6.6.6.6", "time": "2026-11-19 10:07:00"}]
+            with open(log + ".1", "w") as f:            # archive = plus ancien
+                f.write("\n".join(json.dumps(e) for e in old) + "\n")
+            with open(log, "w") as f:
+                f.write("\n".join(json.dumps(e) for e in new) + "\nligne corrompue\n")
+
+            events, bad = waf_report.read_events(log)
+            self.assertEqual((len(events), bad), (4, 1))
+            r = waf_report.analyze(events)
+            self.assertEqual(r["period"]["start"], "2026-11-19 09:00:00")
+            self.assertEqual(r["total_attacks"], 3)
+            self.assertEqual(r["top_ips"][0], ("6.6.6.6", 2))
+            self.assertEqual(r["scanners"], {"sqlmap": 1})
+            self.assertEqual(r["bans"], 1)
+            self.assertEqual(r["traps"], [("/.env", 1)])
+            self.assertEqual(r["timeline"], {"2026-11-19 09h": 1, "2026-11-19 10h": 2})
+
+
+def start_backend():
+    backend = HTTPServer(("127.0.0.1", 0), DemoHandler)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    return backend
+
+
+def start_waf(tmp, backend, **overrides):
+    config = waf.load_config()
+    config.update(port=0, backend=f"http://127.0.0.1:{backend.server_address[1]}",
+                  dashboard_token="secret-test", log_file=os.path.join(tmp, "waf.log"),
+                  ban_file=os.path.join(tmp, "bans.json"), **overrides)
+    logger = waf.setup_logger(config["log_file"], console=False)
+    server = waf.WAFServer(config, waf.RuleSet(RULES_FILE, logger), logger)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+class WebhookCatcher(BaseHTTPRequestHandler):
+    """Faux Discord : enregistre les alertes recues."""
+    received = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        WebhookCatcher.received.append(json.loads(self.rfile.read(length)))
+        self.send_response(204)
+        self.end_headers()
+
+
+class TestAlertsAndNetwork(unittest.TestCase):
+    """Alertes webhook, liste noire CIDR et anti-slowloris."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.hook = HTTPServer(("127.0.0.1", 0), WebhookCatcher)
+        threading.Thread(target=cls.hook.serve_forever, daemon=True).start()
+        cls.backend = start_backend()
+        cls.waf = start_waf(cls.tmp.name, cls.backend, client_timeout=1,
+                            alert_webhook=f"http://127.0.0.1:{cls.hook.server_address[1]}/hook",
+                            alert_format="discord")
+        cls.url = f"http://127.0.0.1:{cls.waf.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in (cls.waf, cls.backend, cls.hook):
+            server.shutdown()
+            server.server_close()
+        cls.tmp.cleanup()
+
+    def status(self, path):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(self.url + path) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_trap_sends_one_alert(self):
+        WebhookCatcher.received.clear()
+        self.waf.state.unban("127.0.0.1")
+        self.status("/.git/config")
+        self.waf.state.unban("127.0.0.1")
+        self.status("/.env")                       # 2e piege : pendant le cooldown, pas de 2e alerte
+        time.sleep(0.5)                            # l'alerte part dans un thread separe
+        self.assertEqual(len(WebhookCatcher.received), 1)
+        self.assertIn("trap", WebhookCatcher.received[0]["content"])
+        self.assertIn("/.git/config", WebhookCatcher.received[0]["content"])
+        self.waf.state.unban("127.0.0.1")
+
+    def test_blocklist_cidr(self):
+        self.waf.nets["blocklist_ips"] = waf.IPSet(["127.0.0.0/8"])
+        try:
+            self.assertEqual(self.status("/"), 403)
+        finally:
+            self.waf.nets["blocklist_ips"] = waf.IPSet([])
+        self.assertEqual(self.status("/"), 200)
+
+    def test_slowloris_disconnected(self):
+        sock = socket.create_connection(self.waf.server_address[:2])
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")   # requete jamais terminee
+        sock.settimeout(5)
+        start = time.time()
+        data = sock.recv(1024)                             # le WAF coupe apres client_timeout (1 s)
+        sock.close()
+        self.assertEqual(data, b"")
+        self.assertLess(time.time() - start, 4)
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl absent")
+class TestTLS(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cert, key = os.path.join(cls.tmp.name, "c.crt"), os.path.join(cls.tmp.name, "c.key")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-keyout", key, "-out", cert, "-subj", "/CN=localhost",
+                        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+                       check=True, capture_output=True)
+        cls.cert = cert
+        cls.backend = start_backend()
+        cls.waf = start_waf(cls.tmp.name, cls.backend, tls={"cert": cert, "key": key})
+        cls.port = cls.waf.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in (cls.waf, cls.backend):
+            server.shutdown()
+            server.server_close()
+        cls.tmp.cleanup()
+
+    def test_https_with_hsts(self):
+        ctx = ssl.create_default_context(cafile=self.cert)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                             urllib.request.HTTPSHandler(context=ctx))
+        with opener.open(f"https://localhost:{self.port}/search?q=switch") as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn("max-age=31536000", r.headers["Strict-Transport-Security"])
+
+    def test_attack_blocked_over_https(self):
+        ctx = ssl.create_default_context(cafile=self.cert)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                             urllib.request.HTTPSHandler(context=ctx))
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            opener.open(f"https://localhost:{self.port}/search?q=%3Cscript%3E")
+        self.assertEqual(err.exception.code, 403)
+
+    def test_old_tls_refused(self):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        with warnings.catch_warnings():               # TLS 1.0/1.1 sont deprecies : c'est voulu ici
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                ctx.maximum_version = ssl.TLSVersion.TLSv1_1
+                ctx.minimum_version = ssl.TLSVersion.TLSv1
+            except ValueError:
+                self.skipTest("TLS 1.0 indisponible sur cette machine")
+        with self.assertRaises((ssl.SSLError, ConnectionError, OSError)):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as raw:
+                with ctx.wrap_socket(raw) as tls:
+                    tls.sendall(b"GET / HTTP/1.0\r\n\r\n")
+                    tls.recv(10)
 
 
 class TestIntegration(unittest.TestCase):
