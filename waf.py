@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-MiniWAF v3 - Web Application Firewall en reverse proxy (Python, sans dependance).
+MiniWAF v4 - Web Application Firewall en reverse proxy (Python, sans dependance).
 
-    Client  --->  MiniWAF (:8080)  --->  Site protege (:5000)
-                     |
-                     +--> waf.log (JSON)       +--> tableau de bord /__waf/
-                     +--> bans.json (bans)     +--> metriques Prometheus /__waf/metrics
+    Client  --HTTP/HTTPS-->  MiniWAF (:8080)  --->  Site protege (:5000)
+                                |
+                                +--> waf.log (JSON)       +--> tableau de bord /__waf/
+                                +--> bans.json (bans)     +--> metriques Prometheus /__waf/metrics
+                                +--> alertes Discord / Slack (webhook)
 
 Fonctionnement :
-  1. Controles du protocole : methode, longueur d'URL, nombre d'en-tetes, smuggling.
+  0. Listes d'IP (CIDR accepte) : liste noire bloquee d'office, liste blanche jamais inspectee.
+  1. Controles du protocole : methode, longueur d'URL, nombre d'en-tetes, smuggling, slowloris.
   2. Chemins pieges (/.env, /.git/, /wp-admin...) : tout visiteur qui y touche est banni.
   3. Chaque requete est normalisee (decodage URL multiple, entites HTML,
      commentaires SQL, octets nuls) pour dejouer les techniques d'evasion.
@@ -18,16 +20,19 @@ Fonctionnement :
   5. Les reponses du site sont aussi inspectees : une fuite (erreur SQL, /etc/passwd,
      cle privee...) est bloquee, et les numeros de carte bancaire sont masques.
   6. Une IP qui cumule les attaques est bannie, et la duree double a chaque recidive.
+  7. Les evenements graves (ban, piege, fuite) declenchent une alerte en temps reel.
 """
 
 import argparse
 import hmac
 import html
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
+import ssl
 import threading
 import time
 import urllib.error
@@ -39,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "3.0"
+VERSION = "4.0"
 
 # En-tetes propres a une connexion, a ne pas retransmettre
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
@@ -64,12 +69,19 @@ DEFAULT_CONFIG = {
     "max_url_length": 2048,
     "max_headers": 50,
     "max_body": 1_000_000,
+    "client_timeout": 30,                  # anti-slowloris : coupe les clients trop lents
     "inspect_responses": True,
     "mask_card_numbers": True,
     "max_inspect_size": 2_000_000,
     "whitelist_ips": [],
+    "blocklist_ips": [],
     "whitelist_paths": [],
     "trusted_proxies": [],
+    "tls": {"cert": "", "key": ""},        # renseigner pour activer le HTTPS
+    "alert_webhook": "",                   # URL de webhook Discord ou Slack
+    "alert_format": "discord",             # "discord", "slack" ou "json"
+    "alert_on": ["banned", "trap", "leak_blocked"],
+    "alert_cooldown": 60,                  # max 1 alerte par (type, IP) toutes les 60 s
     "hide_backend_errors": True,
     "dashboard_token": "",
     "dashboard_ips": ["127.0.0.1", "::1"],
@@ -96,13 +108,33 @@ def load_config(path=None):
 def setup_logger(path, console=True):
     logger = logging.getLogger("miniwaf")
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    for handler in list(logger.handlers):   # ferme proprement les anciens fichiers de log
+        handler.close()
+        logger.removeHandler(handler)
     file_handler = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(file_handler)
     if console:
         logger.addHandler(logging.StreamHandler())
     return logger
+
+
+# ====================================================================== listes d'IP
+class IPSet:
+    """Liste d'adresses et de reseaux CIDR : "1.2.3.4", "10.0.0.0/8", "2001:db8::/32".
+
+    Une entree invalide provoque une erreur au demarrage (mieux qu'une liste ignoree en silence).
+    """
+
+    def __init__(self, entries):
+        self.networks = [ipaddress.ip_network(entry, strict=False) for entry in entries]
+
+    def __contains__(self, ip):
+        try:
+            address = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(address in network for network in self.networks)
 
 
 # ====================================================================== normalisation
@@ -167,7 +199,7 @@ class RuleSet:
         self.path = path
         self.logger = logger or logging.getLogger("miniwaf")
         self.lock = threading.Lock()
-        self.rules, self.response_rules, self.traps = [], [], []
+        self.rules, self.response_rules, self.traps, self.exclusions = [], [], [], []
         self.bad_agents, self.mtime = None, 0
         self.reload()
 
@@ -177,11 +209,13 @@ class RuleSet:
         response_rules = [{**r, "regex": re.compile(r["pattern"], re.I)}
                           for r in data.get("response_rules", [])]
         traps = [t.lower() for t in data.get("traps", [])]
+        # Exceptions : certaines regles sont desactivees sur certains chemins (faux positifs connus)
+        exclusions = [(e["path"].lower(), set(e["rules"])) for e in data.get("exclusions", [])]
         agents = data.get("bad_agents", [])
         agents_re = re.compile("|".join(map(re.escape, agents)), re.I) if agents else None
         with self.lock:
             self.rules, self.response_rules = rules, response_rules
-            self.traps, self.bad_agents = traps, agents_re
+            self.traps, self.bad_agents, self.exclusions = traps, agents_re, exclusions
         self.mtime = os.path.getmtime(self.path)
 
     def is_trap(self, path):
@@ -215,11 +249,21 @@ class RuleSet:
         match = agents.search(user_agent) if agents else None
         return match.group(0) if match else None
 
-    def scan(self, zones):
+    def excluded_rules(self, path):
+        path = path.lower()
+        with self.lock:
+            exclusions = self.exclusions
+        excluded = set()
+        for prefix, rule_ids in exclusions:
+            if path.startswith(prefix):
+                excluded |= rule_ids
+        return excluded
+
+    def scan(self, zones, path=""):
         """zones = {"url": "...", "body": "...", ...}. Retourne (score, correspondances)."""
         with self.lock:
             rules = self.rules
-        matches, seen = [], set()
+        matches, seen = [], self.excluded_rules(path)   # regles exclues = deja "vues"
         for zone, raw in zones.items():
             if not raw:
                 continue
@@ -449,18 +493,68 @@ class WAFServer(ThreadingHTTPServer):
         self.rules = rules
         self.state = State(config)
         self.logger = logger or logging.getLogger("miniwaf")
+        self.nets = {key: IPSet(config[key]) for key in
+                     ("whitelist_ips", "blocklist_ips", "trusted_proxies", "dashboard_ips")}
+        self.alert_lock = threading.Lock()
+        self.last_alerts = {}
         super().__init__((config["listen"], config["port"]), WAFHandler)
+
+        tls = config.get("tls") or {}
+        self.tls = bool(tls.get("cert"))
+        if self.tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2   # TLS 1.0/1.1 sont obsoletes
+            ctx.load_cert_chain(tls["cert"], tls["key"])
+            # La poignee de main TLS se fait dans le thread du client, pas dans la boucle d'accept :
+            # un client lent ne bloque pas les autres.
+            self.socket = ctx.wrap_socket(self.socket, server_side=True, do_handshake_on_connect=False)
+
+    def handle_error(self, request, client_address):
+        # Clients qui coupent, handshakes TLS rates, timeouts : on journalise sans afficher de trace
+        self.logger.info(json.dumps({"action": "connection_error", "ip": client_address[0]}))
 
     def event(self, **event):
         event["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.state.add_event(event)
         self.logger.info(json.dumps(event, ensure_ascii=False))
+        if self.cfg.get("alert_webhook") and event.get("action") in self.cfg.get("alert_on", []):
+            self.alert(event)
+
+    # ------------------------------------------------------------ alertes temps reel
+    def alert(self, event):
+        key = (event.get("action"), event.get("ip"))
+        now = time.time()
+        with self.alert_lock:   # anti-spam : une seule alerte par (type, IP) pendant le cooldown
+            if now - self.last_alerts.get(key, 0) < self.cfg.get("alert_cooldown", 60):
+                return
+            self.last_alerts[key] = now
+        text = (f"[MiniWAF] {event.get('action')} | IP {event.get('ip', '?')} | "
+                f"{', '.join(event.get('categories', [])) or '-'} | {event.get('path', '-')}")
+        fmt = self.cfg.get("alert_format", "discord")
+        payload = {"discord": {"content": text}, "slack": {"text": text}}.get(fmt, event)
+        # Envoi dans un thread : un webhook lent ne doit jamais ralentir le trafic
+        threading.Thread(target=self._post_alert, args=(json.dumps(payload).encode(),),
+                         daemon=True).start()
+
+    def _post_alert(self, data):
+        request = urllib.request.Request(self.cfg["alert_webhook"], data=data, method="POST",
+                                         headers={"Content-Type": "application/json",
+                                                  "User-Agent": f"MiniWAF/{VERSION}"})
+        try:
+            urllib.request.urlopen(request, timeout=5).close()
+        except Exception as e:  # le WAF continue meme si l'alerte echoue
+            self.logger.error(json.dumps({"action": "alert_error", "error": str(e)}))
 
 
 class WAFHandler(BaseHTTPRequestHandler):
     server_version = "MiniWAF"
     sys_version = ""
     rid = "-"
+
+    def setup(self):
+        # Anti-slowloris : un client qui envoie sa requete octet par octet est deconnecte
+        self.timeout = self.server.cfg["client_timeout"]
+        super().setup()
 
     def log_message(self, *args):
         pass  # on utilise notre propre journal JSON
@@ -470,10 +564,17 @@ class WAFHandler(BaseHTTPRequestHandler):
     def cfg(self):
         return self.server.cfg
 
+    @property
+    def security_headers(self):
+        headers = dict(self.cfg["security_headers"])
+        if self.server.tls:  # HSTS : le navigateur n'utilisera plus que le HTTPS pendant 1 an
+            headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return headers
+
     def client_ip(self):
         """X-Forwarded-For n'est cru que s'il vient d'un proxy de confiance (sinon il est falsifiable)."""
         ip = self.client_address[0]
-        if ip in self.cfg["trusted_proxies"]:
+        if ip in self.server.nets["trusted_proxies"]:
             forwarded = self.headers.get("X-Forwarded-For", "")
             if forwarded:
                 return forwarded.split(",")[0].strip()
@@ -485,7 +586,7 @@ class WAFHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Request-ID", self.rid)
-        for key, value in {**self.cfg["security_headers"], **(headers or {})}.items():
+        for key, value in {**self.security_headers, **(headers or {})}.items():
             self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
@@ -508,7 +609,12 @@ class WAFHandler(BaseHTTPRequestHandler):
             return self.dashboard(ip, path)
 
         server.rules.maybe_reload()
-        whitelisted_ip = ip in self.cfg["whitelist_ips"]
+        whitelisted_ip = ip in server.nets["whitelist_ips"]
+
+        if not whitelisted_ip and ip in server.nets["blocklist_ips"]:
+            state.count("blocklisted")
+            server.event(ip=ip, action="blocklisted", path=self.path[:200], request_id=self.rid)
+            return self.deny(403, "Acces refuse.")
 
         # --- Controles du protocole
         if self.command not in self.cfg["allowed_methods"]:
@@ -520,7 +626,7 @@ class WAFHandler(BaseHTTPRequestHandler):
         if len(self.path) > self.cfg["max_url_length"]:
             state.count("blocked")
             server.event(ip=ip, action="blocked", categories=["URL trop longue"],
-                         length=len(self.path), request_id=self.rid)
+                         path=self.path[:200], length=len(self.path), request_id=self.rid)
             return self.deny(414, "URL trop longue.")
         if len(self.headers) > self.cfg["max_headers"]:
             state.count("blocked")
@@ -580,7 +686,7 @@ class WAFHandler(BaseHTTPRequestHandler):
         for key, value in self.headers.items():
             if key.lower() not in NOT_INSPECTED:
                 zones[f"header:{key}"] = value
-        score, matches = server.rules.scan(zones)
+        score, matches = server.rules.scan(zones, path)
 
         user_agent = self.headers.get("User-Agent", "")
         scanner = server.rules.check_agent(user_agent)
@@ -617,7 +723,7 @@ class WAFHandler(BaseHTTPRequestHandler):
         skip = HOP_BY_HOP | ({"accept-encoding"} if self.cfg["inspect_responses"] else set())
         headers = {k: v for k, v in self.headers.items() if k.lower() not in skip}
         headers["X-Forwarded-For"] = ip
-        headers["X-Forwarded-Proto"] = "http"
+        headers["X-Forwarded-Proto"] = "https" if self.server.tls else "http"
         headers["X-Request-ID"] = self.rid
         request = urllib.request.Request(url, data=body or None, headers=headers, method=self.command)
         try:
@@ -670,7 +776,7 @@ class WAFHandler(BaseHTTPRequestHandler):
             if key.lower() not in HOP_BY_HOP and key.lower() not in LEAKY_HEADERS:
                 self.send_header(key, value)
                 sent.add(key.lower())
-        for key, value in self.cfg["security_headers"].items():
+        for key, value in self.security_headers.items():
             if key.lower() not in sent:
                 self.send_header(key, value)
         self.send_header("X-Request-ID", self.rid)
@@ -686,7 +792,7 @@ class WAFHandler(BaseHTTPRequestHandler):
         given = self.headers.get("X-WAF-Token") or query.get("token", [""])[0]
         token = self.cfg["dashboard_token"]
         # compare_digest : comparaison en temps constant (pas de timing attack sur le token)
-        if ip not in self.cfg["dashboard_ips"] or not hmac.compare_digest(given.encode(), token.encode()):
+        if ip not in self.server.nets["dashboard_ips"] or not hmac.compare_digest(given.encode(), token.encode()):
             self.server.event(ip=ip, action="dashboard_denied", path=path, request_id=self.rid)
             return self.deny(403, "Acces au tableau de bord refuse.")
         no_cache = {"Cache-Control": "no-store"}
@@ -736,12 +842,15 @@ def main():
     server = WAFServer(config, rules, logger)
 
     host, port = server.server_address[:2]
-    print(f"[MiniWAF v{VERSION}] {host}:{port} -> {config['backend']}  "
+    scheme = "https" if server.tls else "http"
+    print(f"[MiniWAF v{VERSION}] {scheme}://{host}:{port} -> {config['backend']}  "
           f"(mode {config['mode']}, seuil {config['anomaly_threshold']})")
     print(f"[MiniWAF] {len(rules.rules)} regles, {len(rules.response_rules)} regles de reponse, "
           f"{len(rules.traps)} pieges, {len(server.state.banned)} IP deja bannies")
-    print(f"[MiniWAF] Tableau de bord : http://{host}:{port}/__waf/?token={config['dashboard_token']}")
-    print(f"[MiniWAF] Metriques     : http://{host}:{port}/__waf/metrics?token={config['dashboard_token']}")
+    print(f"[MiniWAF] {len(rules.exclusions)} exceptions, alertes "
+          f"{'activees (' + config['alert_format'] + ')' if config['alert_webhook'] else 'desactivees'}")
+    print(f"[MiniWAF] Tableau de bord : {scheme}://{host}:{port}/__waf/?token={config['dashboard_token']}")
+    print(f"[MiniWAF] Metriques     : {scheme}://{host}:{port}/__waf/metrics?token={config['dashboard_token']}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
