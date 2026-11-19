@@ -4,8 +4,12 @@
 #
 # Usage : WAF_TOKEN=<token du tableau de bord> ./test_attacks.sh
 # Le token sert a debannir ton IP entre les tests (sinon le 2e lancement serait bloque).
+# En HTTPS : WAF=https://localhost:8080 WAF_TOKEN=<token> ./test_attacks.sh
 WAF="${WAF:-http://127.0.0.1:8080}"
 TOKEN="${WAF_TOKEN:-}"
+CURL_OPTS=""
+case "$WAF" in https://*) CURL_OPTS="--cacert certs/waf.crt" ;; esac
+c() { curl $CURL_OPTS "$@"; }
 PASS=0; FAIL=0
 GREEN=$(printf '\033[32m'); RED=$(printf '\033[31m'); YELLOW=$(printf '\033[33m'); RESET=$(printf '\033[0m')
 
@@ -15,17 +19,17 @@ fail() { FAIL=$((FAIL+1)); printf "  ${RED}ECHEC${RESET} %s\n" "$1"; }
 # check <code attendu> <nom> <arguments curl...>
 check() {
   expected="$1"; name="$2"; shift 2
-  code=$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$@")
+  code=$(c -s --path-as-is -o /dev/null -w '%{http_code}' "$@")
   if [ "$code" = "$expected" ]; then ok "$(printf '%-34s %s' "$name" "$code")"
   else fail "$(printf '%-34s %s (attendu %s)' "$name" "$code" "$expected")"; fi
 }
 
 # body_has <texte> <nom> <url> : verifie que la reponse contient le texte
-body_has()  { if curl -s "$3" | grep -q -- "$1"; then ok "$2"; else fail "$2"; fi; }
-body_hasnt() { if curl -s "$3" | grep -q -- "$1"; then fail "$2"; else ok "$2"; fi; }
+body_has()  { if c -s "$3" | grep -q -- "$1"; then ok "$2"; else fail "$2"; fi; }
+body_hasnt() { if c -s "$3" | grep -q -- "$1"; then fail "$2"; else ok "$2"; fi; }
 
 unban() {
-  [ -n "$TOKEN" ] && curl -s -o /dev/null -X POST -H "X-WAF-Token: $TOKEN" "$WAF/__waf/unban?ip=127.0.0.1"
+  [ -n "$TOKEN" ] && c -s -o /dev/null -X POST -H "X-WAF-Token: $TOKEN" "$WAF/__waf/unban?ip=127.0.0.1"
 }
 
 if [ -z "$TOKEN" ]; then
@@ -49,10 +53,15 @@ check 500 "Erreur SQL bloquee"         "$WAF/product?id=abc"
 body_hasnt "SQL syntax"                "Message SQL invisible"                  "$WAF/product?id=abc"
 body_hasnt "4111 1111 1111 1111"       "Carte bancaire masquee"                 "$WAF/orders"
 body_has   "\*\*\*\* \*\*\*\* \*\*\*\* 1111" "4 derniers chiffres conserves"    "$WAF/orders"
-if curl -sI "$WAF/" | grep -qi "x-powered-by\|apache"; then fail "Banniere du backend masquee"
+if c -sI "$WAF/" | grep -qi "x-powered-by\|apache"; then fail "Banniere du backend masquee"
 else ok "Banniere du backend masquee"; fi
-if curl -sI "$WAF/" | grep -qi "x-request-id"; then ok "En-tete X-Request-ID present"
+if c -sI "$WAF/" | grep -qi "x-request-id"; then ok "En-tete X-Request-ID present"
 else fail "En-tete X-Request-ID present"; fi
+
+if [ -n "$CURL_OPTS" ]; then
+  if c -sI "$WAF/" | grep -qi "strict-transport-security"; then ok "HSTS actif en HTTPS"
+  else fail "HSTS actif en HTTPS"; fi
+fi
 
 echo "== Protocole =="
 check 400 "Request smuggling (TE)"     "$WAF/login" -H "Transfer-Encoding: chunked" -d "x"
