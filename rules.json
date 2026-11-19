@@ -1,187 +1,68 @@
 {
-  "bad_agents": [
-    "sqlmap",
-    "nikto",
-    "nmap",
-    "masscan",
-    "dirbuster",
-    "gobuster",
-    "ffuf",
-    "wpscan",
-    "acunetix",
-    "nessus",
-    "hydra",
-    "nuclei",
-    "zgrab"
-  ],
+  "bad_agents": ["sqlmap", "nikto", "nmap", "masscan", "dirbuster", "gobuster", "ffuf",
+                 "wpscan", "acunetix", "nessus", "hydra", "nuclei", "zgrab"],
   "rules": [
-    {
-      "id": 1001,
-      "category": "SQLi",
-      "score": 5,
-      "description": "UNION SELECT",
-      "pattern": "\\bunion\\b.{0,20}?\\bselect\\b"
-    },
-    {
-      "id": 1002,
-      "category": "SQLi",
-      "score": 5,
-      "description": "Tautologie numerique (OR 1=1)",
-      "pattern": "\\b(or|and)\\s+['\\\"]?\\d+['\\\"]?\\s*=\\s*['\\\"]?\\d+"
-    },
-    {
-      "id": 1003,
-      "category": "SQLi",
-      "score": 5,
-      "description": "Tautologie texte (' OR 'a'='a)",
-      "pattern": "'\\s*(or|and)\\s+'[^']*'\\s*=\\s*'"
-    },
-    {
-      "id": 1004,
-      "category": "SQLi",
-      "score": 5,
-      "description": "Injection temporelle (blind SQLi)",
-      "pattern": "\\b(sleep|benchmark|pg_sleep)\\s*\\(|\\bwaitfor\\s+delay\\b"
-    },
-    {
-      "id": 1005,
-      "category": "SQLi",
-      "score": 5,
-      "description": "Requetes empilees (; DROP ...)",
-      "pattern": ";\\s*(drop|delete|insert|update|alter|create|truncate)\\s"
-    },
-    {
-      "id": 1006,
-      "category": "SQLi",
-      "score": 5,
-      "description": "Quote suivie d'un commentaire SQL",
-      "pattern": "'\\s*(--|#)"
-    },
-    {
-      "id": 1007,
-      "category": "SQLi",
-      "score": 3,
-      "description": "Acces aux tables systeme",
-      "pattern": "\\binformation_schema\\b|\\bsysobjects\\b"
-    },
-    {
-      "id": 1008,
-      "category": "SQLi",
-      "score": 3,
-      "description": "Mots-cles SQL (SELECT ... FROM)",
-      "pattern": "\\b(select|insert|delete)\\b.{0,40}?\\b(from|into)\\b"
-    },
-    {
-      "id": 1009,
-      "category": "SQLi",
-      "score": 3,
-      "description": "Fonctions SQL sensibles",
-      "pattern": "\\b(concat|load_file|char|outfile)\\s*\\("
-    },
-    {
-      "id": 2001,
-      "category": "XSS",
-      "score": 5,
-      "description": "Balise script",
-      "pattern": "<\\s*script\\b"
-    },
-    {
-      "id": 2002,
-      "category": "XSS",
-      "score": 5,
-      "description": "Pseudo-protocole javascript:",
-      "pattern": "javascript\\s*:"
-    },
-    {
-      "id": 2003,
-      "category": "XSS",
-      "score": 5,
-      "description": "Gestionnaire d'evenement HTML",
-      "pattern": "\\bon(error|load|click|mouseover|focus|toggle|animationstart)\\s*="
-    },
-    {
-      "id": 2004,
-      "category": "XSS",
-      "score": 4,
-      "description": "Balises dangereuses",
-      "pattern": "<\\s*(iframe|object|embed|svg)\\b"
-    },
-    {
-      "id": 2005,
-      "category": "XSS",
-      "score": 4,
-      "description": "Acces au DOM sensible",
-      "pattern": "document\\.(cookie|location|domain)|window\\.location"
-    },
-    {
-      "id": 2006,
-      "category": "XSS",
-      "score": 2,
-      "description": "Fonctions de popup",
-      "pattern": "\\b(alert|prompt|confirm)\\s*\\("
-    },
-    {
-      "id": 3001,
-      "category": "Path traversal",
-      "score": 5,
-      "description": "Remontee de dossier",
-      "pattern": "\\.\\.[/\\\\]"
-    },
-    {
-      "id": 3002,
-      "category": "Path traversal",
-      "score": 5,
-      "description": "Fichiers systeme Linux",
-      "pattern": "/etc/(passwd|shadow|hosts|group)\\b"
-    },
-    {
-      "id": 3003,
-      "category": "Path traversal",
-      "score": 5,
-      "description": "Fichiers systeme Windows",
-      "pattern": "c:\\\\windows|\\bboot\\.ini\\b|\\bwin\\.ini\\b"
-    },
-    {
-      "id": 4001,
-      "category": "Command injection",
-      "score": 5,
-      "description": "Commande enchainee",
-      "pattern": "(;|\\|\\|?|&&|`)\\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|ping|python|perl)\\b"
-    },
-    {
-      "id": 4002,
-      "category": "Command injection",
-      "score": 5,
-      "description": "Substitution de commande $(...)",
-      "pattern": "\\$\\([^)]*\\)"
-    },
-    {
-      "id": 4003,
-      "category": "Log4Shell",
-      "score": 5,
-      "description": "Injection JNDI (CVE-2021-44228)",
-      "pattern": "\\$\\{\\s*jndi\\s*:"
-    },
-    {
-      "id": 5001,
-      "category": "LFI/RFI",
-      "score": 5,
-      "description": "Wrappers de fichiers",
-      "pattern": "\\b(php|file|data|expect|phar|zip)://"
-    },
-    {
-      "id": 5002,
-      "category": "LFI/RFI",
-      "score": 5,
-      "description": "Inclusion de fichier distant",
-      "pattern": "=\\s*https?://[^&\\s]*\\.(txt|php|sh)\\b"
-    },
-    {
-      "id": 6001,
-      "category": "SSRF",
-      "score": 5,
-      "description": "Metadonnees cloud",
-      "pattern": "169\\.254\\.169\\.254|metadata\\.google\\.internal"
-    }
+    {"id": 1001, "category": "SQLi", "score": 5, "description": "UNION SELECT",
+     "pattern": "\\bunion\\b.{0,20}?\\bselect\\b"},
+    {"id": 1002, "category": "SQLi", "score": 5, "description": "Tautologie numerique (OR 1=1)",
+     "pattern": "\\b(or|and)\\s+['\\\"]?\\d+['\\\"]?\\s*=\\s*['\\\"]?\\d+"},
+    {"id": 1003, "category": "SQLi", "score": 5, "description": "Tautologie texte (' OR 'a'='a)",
+     "pattern": "'\\s*(or|and)\\s+'[^']*'\\s*=\\s*'"},
+    {"id": 1004, "category": "SQLi", "score": 5, "description": "Injection temporelle (blind SQLi)",
+     "pattern": "\\b(sleep|benchmark|pg_sleep)\\s*\\(|\\bwaitfor\\s+delay\\b"},
+    {"id": 1005, "category": "SQLi", "score": 5, "description": "Requetes empilees (; DROP ...)",
+     "pattern": ";\\s*(drop|delete|insert|update|alter|create|truncate)\\s"},
+    {"id": 1006, "category": "SQLi", "score": 5, "description": "Quote suivie d'un commentaire SQL",
+     "pattern": "'\\s*(--|#)"},
+    {"id": 1007, "category": "SQLi", "score": 3, "description": "Acces aux tables systeme",
+     "pattern": "\\binformation_schema\\b|\\bsysobjects\\b"},
+    {"id": 1008, "category": "SQLi", "score": 3, "description": "Mots-cles SQL (SELECT ... FROM)",
+     "pattern": "\\b(select|insert|delete)\\b.{0,40}?\\b(from|into)\\b"},
+    {"id": 1009, "category": "SQLi", "score": 3, "description": "Fonctions SQL sensibles",
+     "pattern": "\\b(concat|load_file|char|outfile)\\s*\\("},
+    {"id": 2001, "category": "XSS", "score": 5, "description": "Balise script",
+     "pattern": "<\\s*script\\b"},
+    {"id": 2002, "category": "XSS", "score": 5, "description": "Pseudo-protocole javascript:",
+     "pattern": "javascript\\s*:"},
+    {"id": 2003, "category": "XSS", "score": 5, "description": "Gestionnaire d'evenement HTML",
+     "pattern": "\\bon(error|load|click|mouseover|focus|toggle|animationstart)\\s*="},
+    {"id": 2004, "category": "XSS", "score": 4, "description": "Balises dangereuses",
+     "pattern": "<\\s*(iframe|object|embed|svg)\\b"},
+    {"id": 2005, "category": "XSS", "score": 4, "description": "Acces au DOM sensible",
+     "pattern": "document\\.(cookie|location|domain)|window\\.location"},
+    {"id": 2006, "category": "XSS", "score": 2, "description": "Fonctions de popup",
+     "pattern": "\\b(alert|prompt|confirm)\\s*\\("},
+    {"id": 3001, "category": "Path traversal", "score": 5, "description": "Remontee de dossier",
+     "pattern": "\\.\\.[/\\\\]"},
+    {"id": 3002, "category": "Path traversal", "score": 5, "description": "Fichiers systeme Linux",
+     "pattern": "/etc/(passwd|shadow|hosts|group)\\b"},
+    {"id": 3003, "category": "Path traversal", "score": 5, "description": "Fichiers systeme Windows",
+     "pattern": "c:\\\\windows|\\bboot\\.ini\\b|\\bwin\\.ini\\b"},
+    {"id": 4001, "category": "Command injection", "score": 5, "description": "Commande enchainee",
+     "pattern": "(;|\\|\\|?|&&|`)\\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|ping|python|perl)\\b"},
+    {"id": 4002, "category": "Command injection", "score": 5, "description": "Substitution de commande $(...)",
+     "pattern": "\\$\\([^)]*\\)"},
+    {"id": 4003, "category": "Log4Shell", "score": 5, "description": "Injection JNDI (CVE-2021-44228)",
+     "pattern": "\\$\\{\\s*jndi\\s*:"},
+    {"id": 5001, "category": "LFI/RFI", "score": 5, "description": "Wrappers de fichiers",
+     "pattern": "\\b(php|file|data|expect|phar|zip)://"},
+    {"id": 5002, "category": "LFI/RFI", "score": 5, "description": "Inclusion de fichier distant",
+     "pattern": "=\\s*https?://[^&\\s]*\\.(txt|php|sh)\\b"},
+    {"id": 6001, "category": "SSRF", "score": 5, "description": "Metadonnees cloud",
+     "pattern": "169\\.254\\.169\\.254|metadata\\.google\\.internal"}
+  ],
+  "traps": ["/.env", "/.git/", "/.aws/", "/.ssh/", "/wp-admin", "/wp-login.php", "/phpmyadmin",
+            "/admin.php", "/server-status", "/config.php.bak", "/backup.sql", "/.DS_Store"],
+  "response_rules": [
+    {"id": 7001, "category": "Fuite SQL", "description": "Message d'erreur SQL",
+     "pattern": "you have an error in your sql syntax|SQLSTATE\\[|pg_query\\(\\)|\\bORA-\\d{5}\\b|sqlite3?\\.OperationalError|psycopg2\\.errors"},
+    {"id": 7002, "category": "Fuite fichier systeme", "description": "Contenu de /etc/passwd",
+     "pattern": "root:[x*]?:0:0:"},
+    {"id": 7003, "category": "Fuite de cle", "description": "Cle privee",
+     "pattern": "-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"},
+    {"id": 7004, "category": "Fuite de trace", "description": "Trace d'exception",
+     "pattern": "Traceback \\(most recent call last\\)|\\bat [\\w.$]+\\([\\w]+\\.java:\\d+\\)|Fatal error: .{0,200} on line \\d+"},
+    {"id": 7005, "category": "Fuite de secret", "description": "Cle d'acces AWS",
+     "pattern": "\\bAKIA[0-9A-Z]{16}\\b"}
   ]
 }
