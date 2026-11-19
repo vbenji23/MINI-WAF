@@ -1,4 +1,5 @@
 waf.log*
 bans.json
 bans.json.tmp
+certs/
 __pycache__/
