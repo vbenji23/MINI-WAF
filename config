@@ -1,0 +1,24 @@
+{
+  "listen": "127.0.0.1",
+  "port": 8080,
+  "backend": "http://127.0.0.1:5000",
+  "backend_timeout": 10,
+  "mode": "block",
+  "anomaly_threshold": 5,
+  "rate_limit": {"requests": 30, "window": 10},
+  "ban": {"strikes": 5, "duration": 300},
+  "max_body": 1000000,
+  "whitelist_ips": [],
+  "whitelist_paths": ["/static/"],
+  "trusted_proxies": [],
+  "hide_backend_errors": true,
+  "dashboard_token": "",
+  "dashboard_ips": ["127.0.0.1", "::1"],
+  "log_file": "waf.log",
+  "security_headers": {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+  }
+}
