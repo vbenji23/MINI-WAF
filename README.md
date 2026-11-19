@@ -11,6 +11,16 @@ Client  ──►  MiniWAF (:8080)  ──►  Site protégé (:5000)
                  └──► /__waf/metrics métriques Prometheus (Grafana, SIEM)
 ```
 
+## Aperçu
+
+**Tableau de bord temps réel** (`/__waf/`) pendant une série d'attaques :
+
+![Tableau de bord MiniWAF](docs/dashboard.png)
+
+**Page renvoyée à l'attaquant** quand une requête est bloquée :
+
+![Requête bloquée](docs/blocked.png)
+
 ## Fonctionnalités
 
 ### 1. Analyse des requêtes (24 règles, `rules.json`)
@@ -154,6 +164,7 @@ miniwaf/
 ├── waf_report.py     # rapport d'analyse des logs
 ├── gen_cert.sh       # certificat HTTPS de test
 ├── test_attacks.sh   # tests en conditions réelles avec curl
+├── docs/             # captures d'écran du README
 └── tests/test_waf.py # tests unitaires et d'intégration
 ```
 
