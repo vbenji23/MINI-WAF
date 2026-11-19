@@ -64,5 +64,11 @@
      "pattern": "Traceback \\(most recent call last\\)|\\bat [\\w.$]+\\([\\w]+\\.java:\\d+\\)|Fatal error: .{0,200} on line \\d+"},
     {"id": 7005, "category": "Fuite de secret", "description": "Cle d'acces AWS",
      "pattern": "\\bAKIA[0-9A-Z]{16}\\b"}
+  ],
+  "exclusions": [
+    {"path": "/admin/sql-console", "rules": [1001, 1007, 1008, 1009],
+     "comment": "Console SQL interne : les admins y tapent du SQL legitime"},
+    {"path": "/api/templates", "rules": [2004, 2006],
+     "comment": "Editeur de modeles : contient des balises <svg> et des confirm() legitimes"}
   ]
 }
