@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-MiniWAF v2 - Web Application Firewall en reverse proxy (Python, sans dependance).
+MiniWAF v3 - Web Application Firewall en reverse proxy (Python, sans dependance).
 
     Client  --->  MiniWAF (:8080)  --->  Site protege (:5000)
                      |
-                     +--> waf.log (JSON)   +--> tableau de bord /__waf/
+                     +--> waf.log (JSON)       +--> tableau de bord /__waf/
+                     +--> bans.json (bans)     +--> metriques Prometheus /__waf/metrics
 
 Fonctionnement :
-  1. Chaque requete est normalisee (decodage URL multiple, entites HTML,
+  1. Controles du protocole : methode, longueur d'URL, nombre d'en-tetes, smuggling.
+  2. Chemins pieges (/.env, /.git/, /wp-admin...) : tout visiteur qui y touche est banni.
+  3. Chaque requete est normalisee (decodage URL multiple, entites HTML,
      commentaires SQL, octets nuls) pour dejouer les techniques d'evasion.
-  2. Les regles de rules.json sont appliquees sur l'URL, le corps et les en-tetes.
-  3. Chaque regle qui matche ajoute des points : la requete est bloquee si le
-     score total atteint le seuil (anomaly scoring, comme l'OWASP Core Rule Set).
-  4. Une IP qui cumule trop d'attaques est bannie temporairement.
+  4. Les regles de rules.json sont appliquees sur l'URL, le corps et les en-tetes.
+     Chaque regle ajoute des points : la requete est bloquee si le score total
+     atteint le seuil (anomaly scoring, comme l'OWASP Core Rule Set).
+  5. Les reponses du site sont aussi inspectees : une fuite (erreur SQL, /etc/passwd,
+     cle privee...) est bloquee, et les numeros de carte bancaire sont masques.
+  6. Une IP qui cumule les attaques est bannie, et la duree double a chaque recidive.
 """
 
 import argparse
@@ -34,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "2.0"
+VERSION = "3.0"
 
 # En-tetes propres a une connexion, a ne pas retransmettre
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
@@ -52,9 +57,16 @@ DEFAULT_CONFIG = {
     "backend_timeout": 10,
     "mode": "block",                       # "block" ou "monitor"
     "anomaly_threshold": 5,
-    "rate_limit": {"requests": 30, "window": 10},
-    "ban": {"strikes": 5, "duration": 300},
+    "rate_limit": {"requests": 60, "window": 10},
+    "ban": {"strikes": 5, "duration": 300, "max_duration": 86400},
+    "ban_file": "bans.json",
+    "allowed_methods": ["GET", "POST", "HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    "max_url_length": 2048,
+    "max_headers": 50,
     "max_body": 1_000_000,
+    "inspect_responses": True,
+    "mask_card_numbers": True,
+    "max_inspect_size": 2_000_000,
     "whitelist_ips": [],
     "whitelist_paths": [],
     "trusted_proxies": [],
@@ -115,6 +127,38 @@ def normalize(value, rounds=4):
     return SPACES.sub(" ", value)
 
 
+# ====================================================================== cartes bancaires
+CARD_RE = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
+
+
+def luhn_ok(digits):
+    """Algorithme de Luhn : verifie qu'une suite de chiffres est un numero de carte valide."""
+    total = 0
+    for i, char in enumerate(reversed(digits)):
+        n = int(char)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
+def mask_cards(text):
+    """Remplace les numeros de carte valides par **** **** **** 1234. Retourne (texte, nb)."""
+    count = 0
+
+    def replace(match):
+        nonlocal count
+        digits = re.sub(r"\D", "", match.group(0))
+        if 13 <= len(digits) <= 19 and luhn_ok(digits):
+            count += 1
+            return "**** **** **** " + digits[-4:]
+        return match.group(0)
+
+    return CARD_RE.sub(replace, text), count
+
+
 # ====================================================================== regles
 class RuleSet:
     """Charge rules.json et le recharge automatiquement s'il est modifie."""
@@ -123,17 +167,36 @@ class RuleSet:
         self.path = path
         self.logger = logger or logging.getLogger("miniwaf")
         self.lock = threading.Lock()
-        self.rules, self.bad_agents, self.mtime = [], None, 0
+        self.rules, self.response_rules, self.traps = [], [], []
+        self.bad_agents, self.mtime = None, 0
         self.reload()
 
     def reload(self):
         data = load_json(self.path)
         rules = [{**r, "regex": re.compile(r["pattern"], re.I)} for r in data["rules"]]
+        response_rules = [{**r, "regex": re.compile(r["pattern"], re.I)}
+                          for r in data.get("response_rules", [])]
+        traps = [t.lower() for t in data.get("traps", [])]
         agents = data.get("bad_agents", [])
         agents_re = re.compile("|".join(map(re.escape, agents)), re.I) if agents else None
         with self.lock:
-            self.rules, self.bad_agents = rules, agents_re
+            self.rules, self.response_rules = rules, response_rules
+            self.traps, self.bad_agents = traps, agents_re
         self.mtime = os.path.getmtime(self.path)
+
+    def is_trap(self, path):
+        path = normalize(path).lower()
+        with self.lock:
+            return any(path.startswith(trap) for trap in self.traps)
+
+    def scan_response(self, text):
+        """Retourne la premiere regle de fuite qui matche dans la reponse, sinon None."""
+        with self.lock:
+            rules = self.response_rules
+        for rule in rules:
+            if rule["regex"].search(text):
+                return rule
+        return None
 
     def maybe_reload(self):
         try:
@@ -174,15 +237,51 @@ class RuleSet:
 class State:
     def __init__(self, config):
         self.cfg = config
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()        # RLock : add_strike() appelle ban() sous le verrou
         self.requests = defaultdict(deque)   # ip -> horodatages des requetes
-        self.strikes = defaultdict(int)      # ip -> nb d'attaques
-        self.banned = {}                     # ip -> fin du ban
+        self.strikes = defaultdict(int)      # ip -> nb d'attaques depuis le dernier ban
+        self.banned = {}                     # ip -> fin du ban (timestamp)
+        self.ban_counts = Counter()          # ip -> nb de bans (pour la recidive)
         self.stats = Counter()
         self.categories = Counter()
         self.attackers = Counter()
         self.events = deque(maxlen=100)
         self.started = time.time()
+        self.load_bans()
+
+    # --- persistance des bans : ils survivent a un redemarrage du WAF
+    def load_bans(self):
+        path = self.cfg.get("ban_file")
+        if not path or not os.path.exists(path):
+            return
+        try:
+            data = load_json(path)
+        except (OSError, ValueError):
+            return
+        now = time.time()
+        self.banned = {ip: end for ip, end in data.get("banned", {}).items() if end > now}
+        self.ban_counts = Counter(data.get("counts", {}))
+
+    def save_bans(self):
+        path = self.cfg.get("ban_file")
+        if not path:
+            return
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"banned": self.banned, "counts": self.ban_counts}, f, indent=2)
+        os.replace(tmp, path)  # ecriture atomique : jamais de fichier a moitie ecrit
+
+    def ban(self, ip):
+        """Bannit l'IP. La duree double a chaque recidive (plafonnee). Retourne la duree."""
+        cfg = self.cfg["ban"]
+        with self.lock:
+            self.ban_counts[ip] += 1
+            duration = min(cfg["duration"] * 2 ** (self.ban_counts[ip] - 1),
+                           cfg.get("max_duration", 86400))
+            self.banned[ip] = time.time() + duration
+            self.strikes[ip] = 0
+            self.save_bans()
+            return duration
 
     def count(self, key):
         with self.lock:
@@ -209,17 +308,25 @@ class State:
                     del self.requests[old_ip]
             return len(q) > limit
 
+    def unban(self, ip):
+        """Debannit une IP et remet son compteur de recidive a zero. Retourne True si elle etait bannie."""
+        with self.lock:
+            was_banned = self.banned.pop(ip, None) is not None
+            self.strikes.pop(ip, None)
+            self.ban_counts.pop(ip, None)
+            self.requests.pop(ip, None)   # remet aussi a zero le compteur du rate limiting
+            self.save_bans()
+            return was_banned
+
     def add_strike(self, ip, categories):
-        """Comptabilise une attaque. Retourne True si l'IP vient d'etre bannie."""
+        """Comptabilise une attaque. Retourne la duree du ban si l'IP vient d'etre bannie, sinon 0."""
         with self.lock:
             self.attackers[ip] += 1
             self.categories.update(categories)
             self.strikes[ip] += 1
             if self.strikes[ip] >= self.cfg["ban"]["strikes"]:
-                self.banned[ip] = time.time() + self.cfg["ban"]["duration"]
-                self.strikes[ip] = 0
-                return True
-            return False
+                return self.ban(ip)
+            return 0
 
     def add_event(self, event):
         with self.lock:
@@ -239,6 +346,20 @@ class State:
                 "events": list(reversed(self.events)),
             }
 
+    def metrics(self):
+        """Format texte Prometheus, pour brancher Grafana ou un SIEM."""
+        snap = self.snapshot()
+        lines = ["# HELP miniwaf_events_total Evenements du WAF par type",
+                 "# TYPE miniwaf_events_total counter"]
+        lines += [f'miniwaf_events_total{{type="{k}"}} {v}' for k, v in sorted(snap["stats"].items())]
+        lines += ["# HELP miniwaf_attacks_total Attaques par categorie",
+                  "# TYPE miniwaf_attacks_total counter"]
+        lines += [f'miniwaf_attacks_total{{category="{k.replace(chr(34), "")}"}} {v}'
+                  for k, v in snap["categories"].items()]
+        lines += ["# TYPE miniwaf_banned_ips gauge", f"miniwaf_banned_ips {len(snap['banned'])}",
+                  "# TYPE miniwaf_uptime_seconds gauge", f"miniwaf_uptime_seconds {snap['uptime']}"]
+        return "\n".join(lines) + "\n"
+
 
 # ====================================================================== pages HTML
 BLOCK_PAGE = """<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>{code} - MiniWAF</title>
@@ -257,7 +378,7 @@ h1{margin:0 0 4px}h2{font-size:1rem;color:#94a3b8;margin:24px 0 8px}
 .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
 table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:10px;overflow:hidden;font-size:.85rem}
 th,td{padding:6px 10px;text-align:left;border-bottom:1px solid #334155;word-break:break-all}
-th{background:#334155}.blocked{color:#f87171}.suspicious{color:#fbbf24}.banned{color:#c084fc}
+th{background:#334155}.blocked,.leak_blocked{color:#f87171}.suspicious{color:#fbbf24}.banned,.trap{color:#c084fc}
 .muted{color:#94a3b8}
 </style></head><body>
 <h1>MiniWAF</h1><div class="muted" id="info">Chargement...</div>
@@ -285,16 +406,25 @@ async function refresh() {
     const d = await res.json(); const s = d.stats;
     document.getElementById("info").textContent = `v${d.version} - mode ${d.mode} - actif depuis ${d.uptime}s`;
     const cards = [["Requetes", s.total], ["Autorisees", s.allowed], ["Bloquees", s.blocked],
-                   ["Suspectes", s.suspicious], ["Rate limit", s.rate_limited], ["Rejets ban", s.banned_hits]];
+                   ["Suspectes", s.suspicious], ["Rate limit", s.rate_limited], ["Rejets ban", s.banned_hits],
+                   ["Pieges", s.traps], ["Fuites bloquees", s.leaks_blocked], ["CB masquees", s.cards_masked]];
     const box = document.getElementById("cards"); box.replaceChildren();
     cards.forEach(([k, v]) => { const c = document.createElement("div"); c.className = "card";
       const b = document.createElement("b"); b.textContent = v || 0; c.append(b, k); box.appendChild(c); });
     fill("cats", ["Categorie", "Nb"], Object.entries(d.categories));
     fill("top", ["IP", "Attaques"], d.top_attackers);
-    fill("bans", ["IP", "Reste (s)"], Object.entries(d.banned));
+    fill("bans", ["IP", "Reste (s)", ""], Object.entries(d.banned).map(([ip, sec]) => [ip, sec, ""]));
+    document.querySelectorAll("#bans tr").forEach((tr, i) => {
+      if (i === 0 || !tr.cells[2]) return;
+      const ip = tr.cells[0].textContent, b = document.createElement("button");
+      b.textContent = "Debannir"; b.onclick = () => unban(ip); tr.cells[2].appendChild(b); });
     fill("events", ["Heure", "IP", "Action", "Categorie", "Score", "Chemin"], d.events.map(e => {
       const row = [e.time, e.ip, e.action, (e.categories || []).join(", "), e.score, e.path]; row.cls = e.action; return row; }));
   } catch (e) { document.getElementById("info").textContent = "Erreur de connexion a l'API"; }
+}
+async function unban(ip) {
+  await fetch("/__waf/unban?ip=" + encodeURIComponent(ip), {method: "POST", headers: {"X-WAF-Token": token}});
+  refresh();
 }
 refresh(); setInterval(refresh, 2000);
 </script></body></html>"""
@@ -330,6 +460,7 @@ class WAFServer(ThreadingHTTPServer):
 class WAFHandler(BaseHTTPRequestHandler):
     server_version = "MiniWAF"
     sys_version = ""
+    rid = "-"
 
     def log_message(self, *args):
         pass  # on utilise notre propre journal JSON
@@ -353,20 +484,22 @@ class WAFHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Request-ID", self.rid)
         for key, value in {**self.cfg["security_headers"], **(headers or {})}.items():
             self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def deny(self, code, reason, incident=None, headers=None):
-        extra = f"<p>ID incident : <code>{incident}</code></p>" if incident else ""
+    def deny(self, code, reason, headers=None, show_id=True):
+        extra = f"<p>ID incident : <code>{self.rid}</code></p>" if show_id else ""
         self.respond(code, BLOCK_PAGE.format(code=code, reason=html.escape(reason), incident=extra),
                      headers=headers)
 
     # ------------------------------------------------------------ point d'entree
     def handle_any(self):
         server, state = self.server, self.server.state
+        self.rid = uuid.uuid4().hex[:12]   # identifiant unique, suivi jusqu'au backend et dans les logs
         ip = self.client_ip()
         path = urllib.parse.urlsplit(self.path).path
         state.count("total")
@@ -377,6 +510,22 @@ class WAFHandler(BaseHTTPRequestHandler):
         server.rules.maybe_reload()
         whitelisted_ip = ip in self.cfg["whitelist_ips"]
 
+        # --- Controles du protocole
+        if self.command not in self.cfg["allowed_methods"]:
+            state.count("blocked")
+            server.event(ip=ip, action="blocked", categories=["Methode interdite"],
+                         method=self.command, path=self.path[:200], request_id=self.rid)
+            return self.deny(405, f"Methode {self.command} interdite.",
+                             headers={"Allow": ", ".join(self.cfg["allowed_methods"])})
+        if len(self.path) > self.cfg["max_url_length"]:
+            state.count("blocked")
+            server.event(ip=ip, action="blocked", categories=["URL trop longue"],
+                         length=len(self.path), request_id=self.rid)
+            return self.deny(414, "URL trop longue.")
+        if len(self.headers) > self.cfg["max_headers"]:
+            state.count("blocked")
+            return self.deny(431, "Trop d'en-tetes HTTP.")
+
         if not whitelisted_ip and state.is_banned(ip):
             state.count("banned_hits")
             return self.deny(403, "Ton adresse IP est temporairement bannie.")
@@ -384,27 +533,45 @@ class WAFHandler(BaseHTTPRequestHandler):
         # --- Protection contre le HTTP request smuggling
         if "Transfer-Encoding" in self.headers:
             server.event(ip=ip, action="blocked", categories=["Smuggling"], path=self.path[:200],
-                         reason="Transfer-Encoding refuse")
+                         reason="Transfer-Encoding refuse", request_id=self.rid)
             state.count("blocked")
             return self.deny(400, "Transfer-Encoding non supporte.")
         raw_length = self.headers.get("Content-Length", "0")
-        if not raw_length.isdigit():
+        if not raw_length.isdigit() or len(self.headers.get_all("Content-Length") or []) > 1:
             state.count("blocked")
             return self.deny(400, "Content-Length invalide.")
         length = int(raw_length)
         if length > self.cfg["max_body"]:
-            server.event(ip=ip, action="blocked", categories=["Body too large"], path=self.path[:200])
+            server.event(ip=ip, action="blocked", categories=["Body too large"], path=self.path[:200],
+                         request_id=self.rid)
             state.count("blocked")
             return self.deny(413, "Corps de requete trop volumineux.")
         body = self.rfile.read(length) if length else b""
 
-        if whitelisted_ip or any(path.startswith(p) for p in self.cfg["whitelist_paths"]):
+        if whitelisted_ip:
+            state.count("whitelisted")
+            return self.forward(ip, body)
+
+        # --- Pieges : aucun visiteur honnete ne demande /.env ou /.git/config
+        if server.rules.is_trap(path):
+            state.count("traps")
+            with state.lock:
+                state.attackers[ip] += 1
+                state.categories["Piege"] += 1
+            duration = state.ban(ip)
+            server.event(ip=ip, action="trap", categories=["Piege"], path=self.path[:200],
+                         user_agent=self.headers.get("User-Agent", "")[:150],
+                         ban_duration=duration, request_id=self.rid)
+            # On repond 404 comme si la page n'existait pas : l'attaquant ne sait pas qu'il est detecte
+            return self.respond(404, "<h1>404 Not Found</h1>")
+
+        if any(path.startswith(p) for p in self.cfg["whitelist_paths"]):
             state.count("whitelisted")
             return self.forward(ip, body)
 
         if state.rate_exceeded(ip):
             state.count("rate_limited")
-            server.event(ip=ip, action="rate_limit", path=self.path[:200])
+            server.event(ip=ip, action="rate_limit", path=self.path[:200], request_id=self.rid)
             return self.deny(429, "Trop de requetes, ralentis.",
                              headers={"Retry-After": str(self.cfg["rate_limit"]["window"])})
 
@@ -425,18 +592,18 @@ class WAFHandler(BaseHTTPRequestHandler):
         if matches:
             categories = sorted({m["category"] for m in matches})
             info = dict(ip=ip, score=score, categories=categories, method=self.command,
-                        path=self.path[:300], user_agent=user_agent[:150],
+                        path=self.path[:300], user_agent=user_agent[:150], request_id=self.rid,
                         rules=[f'{m["id"]} {m["description"]} ({m["zone"]})' for m in matches])
 
             if score >= self.cfg["anomaly_threshold"]:
-                incident = uuid.uuid4().hex[:8]
                 monitor = self.cfg["mode"] == "monitor"
                 state.count("detected" if monitor else "blocked")
-                server.event(action="detected" if monitor else "blocked", incident=incident, **info)
-                if state.add_strike(ip, categories):
-                    server.event(ip=ip, action="banned", duration=self.cfg["ban"]["duration"])
+                server.event(action="detected" if monitor else "blocked", **info)
+                duration = state.add_strike(ip, categories)
+                if duration:
+                    server.event(ip=ip, action="banned", duration=duration, request_id=self.rid)
                 if not monitor:
-                    return self.deny(403, f"Attaque detectee : {', '.join(categories)}", incident)
+                    return self.deny(403, f"Attaque detectee : {', '.join(categories)}")
             else:
                 # Score sous le seuil : on laisse passer mais on garde une trace
                 state.count("suspicious")
@@ -447,16 +614,18 @@ class WAFHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ transfert vers le backend
     def forward(self, ip, body):
         url = self.cfg["backend"].rstrip("/") + self.path
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+        skip = HOP_BY_HOP | ({"accept-encoding"} if self.cfg["inspect_responses"] else set())
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in skip}
         headers["X-Forwarded-For"] = ip
         headers["X-Forwarded-Proto"] = "http"
+        headers["X-Request-ID"] = self.rid
         request = urllib.request.Request(url, data=body or None, headers=headers, method=self.command)
         try:
             response = OPENER.open(request, timeout=self.cfg["backend_timeout"])
         except urllib.error.HTTPError as e:
             response = e  # 3xx/4xx/5xx du backend : on les relaie
         except (urllib.error.URLError, TimeoutError, ConnectionError):
-            self.server.event(ip=ip, action="backend_down", path=self.path[:200])
+            self.server.event(ip=ip, action="backend_down", path=self.path[:200], request_id=self.rid)
             return self.deny(502, "Le site protege est injoignable.")
 
         with response:
@@ -466,9 +635,34 @@ class WAFHandler(BaseHTTPRequestHandler):
 
         # Masque les pages d'erreur du backend (traces, chemins, versions...)
         if status >= 500 and self.cfg["hide_backend_errors"]:
-            self.server.event(ip=ip, action="backend_error_hidden", status=status, path=self.path[:200])
-            self.server.state.count("allowed")
+            self.server.event(ip=ip, action="backend_error_hidden", status=status,
+                              path=self.path[:200], request_id=self.rid)
+            self.server.state.count("errors_hidden")
             return self.deny(status, "Erreur interne du serveur.")
+
+        # Inspection de la reponse (protection contre les fuites de donnees)
+        content_type = backend_headers.get("Content-Type", "")
+        inspectable = (self.cfg["inspect_responses"] and len(data) <= self.cfg["max_inspect_size"]
+                       and not backend_headers.get("Content-Encoding")
+                       and any(t in content_type for t in ("text/", "json", "xml", "javascript")))
+        if inspectable:
+            text = data.decode("utf-8", errors="replace")
+            leak = self.server.rules.scan_response(text)
+            if leak:
+                self.server.state.count("leaks_blocked")
+                with self.server.state.lock:
+                    self.server.state.categories[leak["category"]] += 1
+                self.server.event(ip=ip, action="leak_blocked", categories=[leak["category"]],
+                                  rules=[f'{leak["id"]} {leak["description"]}'],
+                                  path=self.path[:200], request_id=self.rid)
+                return self.deny(500, "Reponse bloquee : fuite de donnees detectee.")
+            if self.cfg["mask_card_numbers"]:
+                masked, count = mask_cards(text)
+                if count:
+                    data = masked.encode("utf-8")
+                    self.server.state.count("cards_masked")
+                    self.server.event(ip=ip, action="cards_masked", count=count,
+                                      path=self.path[:200], request_id=self.rid)
 
         self.send_response(status)
         sent = set()
@@ -479,6 +673,7 @@ class WAFHandler(BaseHTTPRequestHandler):
         for key, value in self.cfg["security_headers"].items():
             if key.lower() not in sent:
                 self.send_header(key, value)
+        self.send_header("X-Request-ID", self.rid)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if self.command != "HEAD":
@@ -492,15 +687,30 @@ class WAFHandler(BaseHTTPRequestHandler):
         token = self.cfg["dashboard_token"]
         # compare_digest : comparaison en temps constant (pas de timing attack sur le token)
         if ip not in self.cfg["dashboard_ips"] or not hmac.compare_digest(given.encode(), token.encode()):
-            self.server.event(ip=ip, action="dashboard_denied", path=path)
+            self.server.event(ip=ip, action="dashboard_denied", path=path, request_id=self.rid)
             return self.deny(403, "Acces au tableau de bord refuse.")
+        no_cache = {"Cache-Control": "no-store"}
+        if path == "/__waf/unban":
+            # Action sensible : POST obligatoire et token dans un en-tete (un site tiers ne peut pas
+            # ajouter d'en-tete personnalise a une requete : protection contre le CSRF)
+            if self.command != "POST" or not self.headers.get("X-WAF-Token"):
+                return self.deny(405, "Utilise POST avec l'en-tete X-WAF-Token.", headers={"Allow": "POST"})
+            target = query.get("ip", [""])[0]
+            was_banned = self.server.state.unban(target)
+            self.server.event(ip=ip, action="unbanned", target=target, request_id=self.rid)
+            return self.respond(200, json.dumps({"ip": target, "was_banned": was_banned}),
+                                "application/json; charset=utf-8", no_cache)
         if path == "/__waf/api":
             return self.respond(200, json.dumps(self.server.state.snapshot(), ensure_ascii=False),
-                                "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+                                "application/json; charset=utf-8", no_cache)
+        if path == "/__waf/metrics":
+            return self.respond(200, self.server.state.metrics(), "text/plain; version=0.0.4", no_cache)
         csp = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"
-        self.respond(200, DASHBOARD_HTML, headers={"Content-Security-Policy": csp, "Cache-Control": "no-store"})
+        self.respond(200, DASHBOARD_HTML, headers={"Content-Security-Policy": csp, **no_cache})
 
+    # Toutes les methodes passent par handle_any, qui refuse celles hors de allowed_methods
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = handle_any
+    do_TRACE = do_CONNECT = do_PROPFIND = handle_any
 
 
 # ====================================================================== lancement
@@ -527,8 +737,11 @@ def main():
 
     host, port = server.server_address[:2]
     print(f"[MiniWAF v{VERSION}] {host}:{port} -> {config['backend']}  "
-          f"(mode {config['mode']}, {len(rules.rules)} regles, seuil {config['anomaly_threshold']})")
+          f"(mode {config['mode']}, seuil {config['anomaly_threshold']})")
+    print(f"[MiniWAF] {len(rules.rules)} regles, {len(rules.response_rules)} regles de reponse, "
+          f"{len(rules.traps)} pieges, {len(server.state.banned)} IP deja bannies")
     print(f"[MiniWAF] Tableau de bord : http://{host}:{port}/__waf/?token={config['dashboard_token']}")
+    print(f"[MiniWAF] Metriques     : http://{host}:{port}/__waf/metrics?token={config['dashboard_token']}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
