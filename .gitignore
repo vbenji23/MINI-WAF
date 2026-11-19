@@ -1,2 +1,4 @@
-waf.log
+waf.log*
+bans.json
+bans.json.tmp
 __pycache__/
